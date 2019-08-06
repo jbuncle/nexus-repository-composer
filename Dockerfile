@@ -8,7 +8,7 @@ RUN cd /nexus-repository-composer/; \
     mvn clean package;
 
 FROM sonatype/nexus3:$NEXUS_VERSION
-ARG NEXUS_VERSION=3.14.0
+ARG NEXUS_VERSION=3.18.0
 ARG NEXUS_BUILD=01
 ARG COMPOSER_VERSION=0.0.2
 ARG TARGET_DIR=/opt/sonatype/nexus/system/org/sonatype/nexus/plugins/nexus-repository-composer/${COMPOSER_VERSION}/
