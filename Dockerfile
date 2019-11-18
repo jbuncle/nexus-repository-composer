@@ -1,7 +1,7 @@
-ARG NEXUS_VERSION=3.18.0
+ARG NEXUS_VERSION=3.19.1
 
 FROM maven:3-jdk-8-alpine AS build
-ARG NEXUS_VERSION=3.18.0
+ARG NEXUS_VERSION=3.19.1
 ARG NEXUS_BUILD=01
 
 # Add src code
@@ -12,7 +12,7 @@ RUN cd /nexus-repository-composer/; \
     mvn clean package;
 
 FROM sonatype/nexus3:$NEXUS_VERSION
-ARG NEXUS_VERSION=3.18.0
+ARG NEXUS_VERSION=3.19.1
 ARG NEXUS_BUILD=01
 ARG COMPOSER_VERSION=0.0.2
 ARG TARGET_DIR=/opt/sonatype/nexus/system/org/sonatype/nexus/plugins/nexus-repository-composer/${COMPOSER_VERSION}/
