@@ -32,4 +32,4 @@ jobs:
             tags: ${{ steps.meta.outputs.tags }}
             labels: ${{ steps.meta.outputs.labels }}
             build-args:  |
-                NEXUS_VERSION=3.44.0
+                NEXUS_VERSION=3.49.0
