@@ -14,3 +14,4 @@ ARG DEPLOY_DIR=/opt/sonatype/nexus/deploy/
 USER root
 COPY --from=build /nexus-repository-composer/nexus-repository-composer/target/nexus-repository-composer-*-bundle.kar ${DEPLOY_DIR}
 USER nexus
+COPY https://download.sonatype.com/nexus/nxrm3-migrator/nexus-db-migrator-3.70.4-02.jar /
