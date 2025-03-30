@@ -12,42 +12,44 @@
  */
 package org.sonatype.nexus.repository.composer.internal;
 
-import java.io.IOException;
-import java.io.InputStream;
-import java.nio.charset.StandardCharsets;
-import java.util.*;
-import java.util.stream.Collectors;
-import java.util.stream.StreamSupport;
-
-import javax.inject.Inject;
-import javax.inject.Named;
-import javax.inject.Singleton;
-
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.google.common.hash.Hashing;
 import org.apache.commons.lang3.StringUtils;
 import org.sonatype.nexus.blobstore.api.Blob;
-import org.sonatype.nexus.blobstore.api.BlobRef;
+import org.sonatype.nexus.common.entity.Continuation;
 import org.sonatype.nexus.common.hash.HashAlgorithm;
 import org.sonatype.nexus.repository.Repository;
-import org.sonatype.nexus.repository.storage.Asset;
-import org.sonatype.nexus.repository.storage.Component;
-import org.sonatype.nexus.repository.storage.StorageTx;
+import org.sonatype.nexus.repository.cache.CacheInfo;
+import org.sonatype.nexus.repository.composer.ComposerContentFacet;
+import org.sonatype.nexus.repository.content.AssetBlob;
+import org.sonatype.nexus.repository.content.fluent.FluentAsset;
+import org.sonatype.nexus.repository.content.fluent.FluentComponent;
+import org.sonatype.nexus.repository.content.fluent.FluentComponents;
+import org.sonatype.nexus.repository.content.fluent.FluentQuery;
 import org.sonatype.nexus.repository.view.Content;
 import org.sonatype.nexus.repository.view.ContentTypes;
 import org.sonatype.nexus.repository.view.Payload;
 import org.sonatype.nexus.repository.view.payloads.StringPayload;
 
-import com.fasterxml.jackson.core.type.TypeReference;
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.google.common.hash.Hashing;
-import org.joda.time.DateTime;
-import org.joda.time.DateTimeZone;
-import org.joda.time.format.DateTimeFormat;
-import org.joda.time.format.DateTimeFormatter;
+import javax.annotation.Nullable;
+import javax.inject.Inject;
+import javax.inject.Named;
+import javax.inject.Singleton;
+import java.io.IOException;
+import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
+import java.time.OffsetDateTime;
+import java.time.ZoneId;
+import java.time.format.DateTimeFormatter;
+import java.time.format.DateTimeFormatterBuilder;
+import java.util.*;
+import java.util.stream.Collectors;
 
 import static com.google.common.base.Preconditions.checkNotNull;
 import static java.util.Collections.singletonMap;
 import static org.sonatype.nexus.repository.composer.internal.ComposerPathUtils.buildZipballPath;
-import static org.sonatype.nexus.repository.composer.internal.ComposerRecipeSupport.*;
+import static org.sonatype.nexus.repository.composer.internal.recipe.ComposerRecipeSupport.*;
 
 /**
  * Class encapsulating JSON processing for Composer-format repositories, including operations for parsing JSON indexes
@@ -60,6 +62,7 @@ public class ComposerJsonProcessor
   private static final String PACKAGE_JSON_PATH = "/p/%package%.json";
 
   private static final String PACKAGE_V2_JSON_PATH = "/p2/%package%.json";
+  private static final String LIST_JSON_PATH = "/packages/list.json";
 
   private static final String VENDOR_AND_PROJECT = "%s/%s";
 
@@ -91,6 +94,11 @@ public class ComposerJsonProcessor
 
   private static final String METADATA_URL_KEY = "metadata-url";
 
+  private static final String LIST_KEY = "list";
+
+  private static final String AVAILABLE_PACKAGES_KEY = "available-packages";
+  private static final String AVAILABLE_PACKAGE_PATTERNS_KEY = "available-package-patterns";
+
   private static final String PROVIDERS_KEY = "providers";
 
   private static final String PACKAGES_KEY = "packages";
@@ -106,8 +114,6 @@ public class ComposerJsonProcessor
   private static final String REQUIRE_KEY = "require";
 
   private static final String REQUIRE_DEV_KEY = "require-dev";
-
-  private static final String SHA256_KEY = "sha256";
 
   private static final String SHASUM_KEY = "shasum";
 
@@ -135,9 +141,27 @@ public class ComposerJsonProcessor
 
   private static final String ZIP_TYPE = "zip";
 
+  /**
+   * List of supported fields in rewritten packages.json
+   */
+  private static final List<String> PACAKGES_JSON_FIELDS = Arrays.asList(
+      METADATA_URL_KEY,
+      PROVIDERS_URL_KEY,
+      LIST_KEY,
+      AVAILABLE_PACKAGES_KEY,
+      AVAILABLE_PACKAGE_PATTERNS_KEY
+  );
+
+  private static final int MAX_AVAILABLE_PACKAGES = 100;
+  private static final int PAGE_SIZE = 50;
+
   private static final ObjectMapper mapper = new ObjectMapper();
 
-  private static final DateTimeFormatter timeFormatter = DateTimeFormat.forPattern("yyyy-MM-dd'T'HH:mm:ssZZ");
+  private static final DateTimeFormatter timeFormatter = new DateTimeFormatterBuilder()
+      .appendPattern("yyyy-MM-dd'T'HH:mm:ss")
+      .parseLenient()
+      .appendOffset("+HH:MM", "+00:00")
+      .toFormatter();
 
   private ComposerJsonExtractor composerJsonExtractor;
   private ComposerJsonMinifier composerJsonMinifier;
@@ -156,7 +180,14 @@ public class ComposerJsonProcessor
   public Content generatePackagesFromList(final Repository repository, final Payload payload) throws IOException {
     // TODO: Parse using JSON tokens rather than loading all this into memory, it "should" work but I'd be careful.
     Map<String, Object> listJson = parseJson(payload);
-    return buildPackagesJson(repository, new LinkedHashSet<>((Collection<String>) listJson.get(PACKAGE_NAMES_KEY)));
+    Content packagesJson = buildPackagesJson(repository, new LinkedHashSet<>((Collection<String>) listJson.get(PACKAGE_NAMES_KEY)));
+
+    // Preserve caching info from list, if present.
+    if (payload instanceof Content) {
+      packagesJson.getAttributes().set(CacheInfo.class, ((Content) payload).getAttributes().get(CacheInfo.class));
+    }
+
+    return packagesJson;
   }
 
   /**
@@ -164,11 +195,21 @@ public class ComposerJsonProcessor
    * for a hosted repository to be queried for its components, which are then provided to this method to build the
    * packages.json for the client to use.
    */
-  public Content generatePackagesFromComponents(final Repository repository, final Iterable<Component> components)
+  public Content generatePackagesFromComponents(final Repository repository, final FluentComponents components)
       throws IOException
   {
-    return buildPackagesJson(repository, StreamSupport.stream(components.spliterator(), false)
-        .map(component -> component.group() + "/" + component.name()).collect(Collectors.toSet()));
+    Set<String> packages = new HashSet<>();
+
+    // Only populate "available-packages", if the repository is "small"
+    if (components.count() <= MAX_AVAILABLE_PACKAGES) {
+      Continuation<FluentComponent> comps = components.browse(PAGE_SIZE, null);
+      while (!comps.isEmpty()) {
+        comps.stream().map(comp -> comp.namespace() + "/" + comp.name()).forEach(packages::add);
+        comps = components.browse(PAGE_SIZE, comps.nextContinuationToken());
+      }
+    }
+
+    return buildPackagesJson(repository, packages);
   }
 
   /**
@@ -178,8 +219,30 @@ public class ComposerJsonProcessor
     Map<String, Object> packagesJson = new LinkedHashMap<>();
     packagesJson.put(PROVIDERS_URL_KEY, repository.getUrl() + PACKAGE_JSON_PATH);
     packagesJson.put(METADATA_URL_KEY, repository.getUrl() + PACKAGE_V2_JSON_PATH);
-    packagesJson.put(PROVIDERS_KEY, names.stream()
-        .collect(Collectors.toMap((each) -> each, (each) -> singletonMap(SHA256_KEY, null))));
+    if (!names.isEmpty()) {
+      packagesJson.put(AVAILABLE_PACKAGES_KEY, names);
+    }
+    return new Content(new StringPayload(mapper.writeValueAsString(packagesJson), ContentTypes.APPLICATION_JSON));
+  }
+
+  /**
+   * Generates a list.json file based on the components provided.
+   *
+   * @param components Components to process
+   * @return JSON list with package names
+   */
+  public Content generateListFromComponents(@Nullable final FluentQuery<FluentComponent> components) throws IOException {
+    Set<String> packages = new HashSet<>();
+    if (components != null) {
+      Continuation<FluentComponent> comps = components.browse(PAGE_SIZE, null);
+      while (!comps.isEmpty()) {
+        comps.stream().map(comp -> comp.namespace() + "/" + comp.name()).forEach(packages::add);
+        comps = components.browse(PAGE_SIZE, comps.nextContinuationToken());
+      }
+    }
+
+    Map<String, Object> packagesJson = singletonMap(PACKAGE_NAMES_KEY, packages.stream().sorted().collect(Collectors.toList()));
+
     return new Content(new StringPayload(mapper.writeValueAsString(packagesJson), ContentTypes.APPLICATION_JSON));
   }
 
@@ -228,8 +291,8 @@ public class ComposerJsonProcessor
           Map<String, Object> distInfo = (Map<String, Object>) versionInfo.get(DIST_KEY);
           if (distInfo != null && ZIP_TYPE.equals(distInfo.get(TYPE_KEY))) {
             versionInfo.put(DIST_KEY,
-                    buildDistInfo(repository, packageName, (String) versionInfo.get(VERSION_KEY), (String) distInfo.get(REFERENCE_KEY),
-                            (String) distInfo.get(SHASUM_KEY), ZIP_TYPE));
+                buildDistInfo(repository, packageName, (String) versionInfo.get(VERSION_KEY), (String) distInfo.get(REFERENCE_KEY),
+                    (String) distInfo.get(SHASUM_KEY), ZIP_TYPE));
           }
         }
       }
@@ -240,56 +303,31 @@ public class ComposerJsonProcessor
     return new StringPayload(mapper.writeValueAsString(json), payload.getContentType());
   }
 
-  private String getAttributeFromAsset(Asset asset, String name) {
-    return asset.formatAttributes() != null && asset.formatAttributes().contains(name) ?
-        asset.formatAttributes().require(name, String.class) : null;
-  }
-
   /**
-   * Builds a provider JSON file for a list of components. This minimal subset will contain the packages entries with
-   * the name, version, and dist information for each component. A timestamp derived from the component's last updated
-   * field and a uid derived from the component group/name/version and last updated time is also included in the JSON.
+   * Rewrites the packages JSON so that source entries are removed and dist entries are pointed back to Nexus.
    */
-  public Content buildProviderJson(final Repository repository,
-                                   final StorageTx storageTx,
-                                   final Iterable<Component> components) throws IOException
-  {
-    Map<String, Map<String, Object>> packages = new LinkedHashMap<>();
-    for (Component component : components) {
-      Asset asset = storageTx.firstAsset(component);
-      BlobRef blobRef = asset.requireBlobRef();
-      Blob blob = storageTx.requireBlob(blobRef);
-      Map<String, Object> composerJson = composerJsonExtractor.extractFromZip(blob);
+  public Payload rewritePackagesJson(final Repository repository, final Payload payload) throws IOException {
+    Map<String, Object> packagesJson = parseJson(payload);
 
-      String vendor = component.group();
-      String project = component.name();
-      String version = component.version();
+    // Strip all fields we do not want to pass-through or rewrite
+    packagesJson.keySet().retainAll(PACAKGES_JSON_FIELDS);
 
-      String name = vendor + "/" + project;
-      String time = component.requireLastUpdated().withZone(DateTimeZone.UTC).toString(timeFormatter);
-
-      if (!packages.containsKey(name)) {
-        packages.put(name, new LinkedHashMap<>());
-      }
-
-      String sha1 = asset.getChecksum(HashAlgorithm.SHA1).toString();
-      Map<String, Object> sourceInfo = null;
-      String sourceType = getAttributeFromAsset(asset, SOURCE_TYPE_FIELD_NAME);
-      String sourceUrl = getAttributeFromAsset(asset, SOURCE_URL_FIELD_NAME);
-      String sourceReference = getAttributeFromAsset(asset, SOURCE_REFERENCE_FIELD_NAME);
-      if (StringUtils.isNotBlank(sourceType) && StringUtils.isNotBlank(sourceUrl) && StringUtils.isNotBlank(sourceReference)) {
-        sourceInfo = new LinkedHashMap<>();
-        sourceInfo.put(TYPE_KEY, sourceType);
-        sourceInfo.put(URL_KEY, sourceUrl);
-        sourceInfo.put(REFERENCE_KEY, sourceReference);
-      }
-      Map<String, Object> packagesForName = packages.get(name);
-      packagesForName
-          .put(version, buildPackageInfo(repository, name, version, sha1, sha1, ZIP_TYPE, time, composerJson, sourceInfo));
+    // Rewrite URLs to our proxy instance, if present in upstream response
+    if (packagesJson.containsKey(METADATA_URL_KEY)) {
+      packagesJson.put(METADATA_URL_KEY, repository.getUrl() + PACKAGE_V2_JSON_PATH);
+    }
+    if (packagesJson.containsKey(PROVIDERS_URL_KEY)) {
+      packagesJson.put(PROVIDERS_URL_KEY, repository.getUrl() + PACKAGE_JSON_PATH);
+    }
+    if (packagesJson.containsKey(LIST_KEY)) {
+      packagesJson.put(LIST_KEY, repository.getUrl() + LIST_JSON_PATH);
     }
 
-    return new Content(new StringPayload(mapper.writeValueAsString(singletonMap(PACKAGES_KEY, packages)),
-        ContentTypes.APPLICATION_JSON));
+    return new StringPayload(mapper.writeValueAsString(packagesJson), payload.getContentType());
+  }
+
+  private String getAttributeFromAsset(FluentAsset asset, String name) {
+    return asset.attributes().get(name, String.class, null);
   }
 
   /**
@@ -297,62 +335,150 @@ public class ComposerJsonProcessor
    * the name, version, and dist information for each component. A timestamp derived from the component's last updated
    * field and a uid derived from the component group/name/version and last updated time is also included in the JSON.
    */
-  public Content buildPackageJson(final Repository repository,
-                                   final StorageTx storageTx,
-                                   final Iterable<Component> components) throws IOException
+  public Optional<Content> buildProviderJson(final Repository repository,
+                                             final ComposerContentFacet content,
+                                             final FluentQuery<FluentComponent> componentQuery) throws IOException
+  {
+    Map<String, Map<String, Object>> packages = new LinkedHashMap<>();
+
+    Continuation<FluentComponent> components = componentQuery.browse(PAGE_SIZE, null);
+    while (!components.isEmpty()) {
+      for (FluentComponent component : components) {
+        FluentAsset asset = component.assets().stream().findFirst().orElse(null);
+        if (!asset.hasBlob()) {
+          return null;
+        }
+        AssetBlob assetBlob = asset.blob().get();
+        Blob blob = content.blobs().blob(assetBlob.blobRef()).orElse(null);
+        Map<String, Object> composerJson = composerJsonExtractor.extractFromZip(blob);
+
+        String vendor = component.namespace();
+        String project = component.name();
+        String version = component.version();
+
+        String name = vendor + "/" + project;
+        String time = formatUtc(component.lastUpdated());
+
+        if (!packages.containsKey(name)) {
+          packages.put(name, new LinkedHashMap<>());
+        }
+
+        String sha1 = assetBlob.checksums().get(HashAlgorithm.SHA1.name());
+        Map<String, Object> sourceInfo = null;
+        String sourceType = getAttributeFromAsset(asset, SOURCE_TYPE_FIELD_NAME);
+        String sourceUrl = getAttributeFromAsset(asset, SOURCE_URL_FIELD_NAME);
+        String sourceReference = getAttributeFromAsset(asset, SOURCE_REFERENCE_FIELD_NAME);
+        if (StringUtils.isNotBlank(sourceType) && StringUtils.isNotBlank(sourceUrl) && StringUtils.isNotBlank(sourceReference)) {
+          sourceInfo = new LinkedHashMap<>();
+          sourceInfo.put(TYPE_KEY, sourceType);
+          sourceInfo.put(URL_KEY, sourceUrl);
+          sourceInfo.put(REFERENCE_KEY, sourceReference);
+        }
+        Map<String, Object> packagesForName = packages.get(name);
+        packagesForName
+            .put(version, buildPackageInfo(repository, name, version, sha1, sha1, ZIP_TYPE, time, composerJson, sourceInfo));
+      }
+
+      components = componentQuery.browse(PAGE_SIZE, components.nextContinuationToken());
+    }
+
+    if (packages.isEmpty()) {
+      return Optional.empty();
+    }
+
+    return Optional.of(
+        new Content(
+            new StringPayload(mapper.writeValueAsString(singletonMap(PACKAGES_KEY, packages)),
+                ContentTypes.APPLICATION_JSON)
+        )
+    );
+  }
+
+  /**
+   * Builds a provider JSON file for a list of components. This minimal subset will contain the packages entries with
+   * the name, version, and dist information for each component. A timestamp derived from the component's last updated
+   * field and a uid derived from the component group/name/version and last updated time is also included in the JSON.
+   */
+  public Optional<Content> buildPackageJson(final Repository repository,
+                                            final ComposerContentFacet content,
+                                            final FluentQuery<FluentComponent> componentQuery) throws IOException
   {
     Map<String, List<Object>> packages = new LinkedHashMap<>();
-    for (Component component : components) {
-      Asset asset = storageTx.firstAsset(component);
-      BlobRef blobRef = asset.requireBlobRef();
-      Blob blob = storageTx.requireBlob(blobRef);
-      Map<String, Object> composerJson = composerJsonExtractor.extractFromZip(blob);
 
-      String vendor = component.group();
-      String project = component.name();
-      String version = component.version();
+    Continuation<FluentComponent> components = componentQuery.browse(PAGE_SIZE, null);
+    while (!components.isEmpty()) {
+      for (FluentComponent component : components) {
+        FluentAsset asset = component.assets().stream().findFirst().orElse(null);
+        if (!asset.hasBlob()) {
+          continue;
+        }
+        AssetBlob assetBlob = asset.blob().get();
+        Blob blob = content.blobs().blob(assetBlob.blobRef()).orElse(null);
+        Map<String, Object> composerJson = composerJsonExtractor.extractFromZip(blob);
 
-      String name = vendor + "/" + project;
-      String time = component.requireLastUpdated().withZone(DateTimeZone.UTC).toString(timeFormatter);
+        String vendor = component.namespace();
+        String project = component.name();
+        String version = component.version();
 
-      if (!packages.containsKey(name)) {
-        packages.put(name, new ArrayList<>());
+        String name = vendor + "/" + project;
+        String time = formatUtc(component.lastUpdated());
+
+        if (!packages.containsKey(name)) {
+          packages.put(name, new ArrayList<>());
+        }
+
+        String sha1 = assetBlob.checksums().get(HashAlgorithm.SHA1.name());
+        Map<String, Object> sourceInfo = null;
+        String sourceType = getAttributeFromAsset(asset, SOURCE_TYPE_FIELD_NAME);
+        String sourceUrl = getAttributeFromAsset(asset, SOURCE_URL_FIELD_NAME);
+        String sourceReference = getAttributeFromAsset(asset, SOURCE_REFERENCE_FIELD_NAME);
+        if (StringUtils.isNotBlank(sourceType) && StringUtils.isNotBlank(sourceUrl) && StringUtils.isNotBlank(sourceReference)) {
+          sourceInfo = new LinkedHashMap<>();
+          sourceInfo.put(TYPE_KEY, sourceType);
+          sourceInfo.put(URL_KEY, sourceUrl);
+          sourceInfo.put(REFERENCE_KEY, sourceReference);
+        }
+        List<Object> packagesForName = packages.get(name);
+        packagesForName.add(
+            buildPackageInfo(repository, name, version, sha1, sha1, ZIP_TYPE, time, composerJson, sourceInfo)
+        );
       }
 
-      String sha1 = asset.getChecksum(HashAlgorithm.SHA1).toString();
-      Map<String, Object> sourceInfo = null;
-      String sourceType = getAttributeFromAsset(asset, SOURCE_TYPE_FIELD_NAME);
-      String sourceUrl = getAttributeFromAsset(asset, SOURCE_URL_FIELD_NAME);
-      String sourceReference = getAttributeFromAsset(asset, SOURCE_REFERENCE_FIELD_NAME);
-      if (StringUtils.isNotBlank(sourceType) && StringUtils.isNotBlank(sourceUrl) && StringUtils.isNotBlank(sourceReference)) {
-        sourceInfo = new LinkedHashMap<>();
-        sourceInfo.put(TYPE_KEY, sourceType);
-        sourceInfo.put(URL_KEY, sourceUrl);
-        sourceInfo.put(REFERENCE_KEY, sourceReference);
-      }
-      List<Object> packagesForName = packages.get(name);
-      packagesForName
-              .add(buildPackageInfo(repository, name, version, sha1, sha1, ZIP_TYPE, time, composerJson, sourceInfo));
+      components = componentQuery.browse(PAGE_SIZE, components.nextContinuationToken());
+    }
+
+    if (packages.isEmpty()) {
+      return Optional.empty();
     }
 
     Map<String, Object> json = new LinkedHashMap<>();
     json.put(PACKAGES_KEY, packages);
     this.composerJsonMinifier.minify(json);
 
-    return new Content(new StringPayload(mapper.writeValueAsString(json),
-            ContentTypes.APPLICATION_JSON));
+    return Optional.of(
+        new Content(new StringPayload(mapper.writeValueAsString(json), ContentTypes.APPLICATION_JSON))
+    );
   }
 
   /**
    * Merges an incoming set of packages.json files.
    */
   public Content mergePackagesJson(final Repository repository, final List<Payload> payloads) throws IOException {
-    Set<String> names = new HashSet<>();
+    boolean useAvailablePackages = true;
+    SortedSet<String> names = new TreeSet<>();
+
     for (Payload payload : payloads) {
       Map<String, Object> json = parseJson(payload);
-      Map<String, Object> providers = (Map<String, Object>) json.get(PROVIDERS_KEY);
-      names.addAll(providers.keySet());
+
+      // Only merge "available-packages", if all repositories provide a list
+      if (useAvailablePackages && json.containsKey(AVAILABLE_PACKAGES_KEY)) {
+        names.addAll((Collection<String>) json.get(AVAILABLE_PACKAGES_KEY));
+      } else {
+        useAvailablePackages = false;
+        names.clear();
+      }
     }
+
     return buildPackagesJson(repository, names);
   }
 
@@ -360,10 +486,10 @@ public class ComposerJsonProcessor
    * Merges incoming provider JSON files, producing a merged file containing only the minimal subset of fields that we
    * need to download artifacts.
    */
-  public Content mergeProviderJson(final Repository repository, final List<Payload> payloads, final DateTime now)
+  public Content mergeProviderJson(final Repository repository, final List<Payload> payloads, final OffsetDateTime now)
       throws IOException
   {
-    String currentTime = now.withZone(DateTimeZone.UTC).toString(timeFormatter);
+    String currentTime = formatUtc(now);
 
     // TODO: Make this more robust, right now it makes a lot of assumptions and doesn't deal with bad things well,
     // can probably consolidate this with the handling for rewrites for proxy (or at least make it more rational).
@@ -411,10 +537,10 @@ public class ComposerJsonProcessor
    * Merges incoming provider JSON files, producing a merged file containing only the minimal subset of fields that we
    * need to download artifacts.
    */
-  public Content mergePackageJson(final Repository repository, final List<Payload> payloads, final DateTime now)
-          throws IOException
+  public Content mergePackageJson(final Repository repository, final List<Payload> payloads, final OffsetDateTime now)
+      throws IOException
   {
-    String currentTime = now.withZone(DateTimeZone.UTC).toString(timeFormatter);
+    String currentTime = formatUtc(now);
 
     // TODO: Make this more robust, right now it makes a lot of assumptions and doesn't deal with bad things well,
     // can probably consolidate this with the handling for rewrites for proxy (or at least make it more rational).
@@ -448,8 +574,8 @@ public class ComposerJsonProcessor
 
             Map<String, Object> packagesForName = packages.get(packageName);
             packagesForName.putIfAbsent(packageVersion, buildPackageInfo(repository, packageName, packageVersion,
-                    (String) distInfo.get(REFERENCE_KEY), (String) distInfo.get(SHASUM_KEY),
-                    (String) distInfo.get(TYPE_KEY), time, versionInfo, sourceInfo));
+                (String) distInfo.get(REFERENCE_KEY), (String) distInfo.get(SHASUM_KEY),
+                (String) distInfo.get(TYPE_KEY), time, versionInfo, sourceInfo));
           }
         }
       }
@@ -465,7 +591,7 @@ public class ComposerJsonProcessor
     this.composerJsonMinifier.minify(json);
 
     return new Content(new StringPayload(mapper.writeValueAsString(json),
-            ContentTypes.APPLICATION_JSON));
+        ContentTypes.APPLICATION_JSON));
   }
 
   private Map<String, Object> buildPackageInfo(final Repository repository,
@@ -571,7 +697,7 @@ public class ComposerJsonProcessor
     String packageProject = packageNameParts[1];
     Map<String, Object> newDistInfo = new LinkedHashMap<>();
     newDistInfo
-        .put(URL_KEY, repository.getUrl() + "/" + buildZipballPath(packageVendor, packageProject, packageVersion));
+        .put(URL_KEY, repository.getUrl() + buildZipballPath(packageVendor, packageProject, packageVersion));
     newDistInfo.put(TYPE_KEY, type);
     newDistInfo.put(REFERENCE_KEY, reference);
     newDistInfo.put(SHASUM_KEY, shasum);
@@ -597,7 +723,7 @@ public class ComposerJsonProcessor
    * Obtains the dist URL for a particular vendor/project and version within a provider JSON payload.
    */
   public String getDistUrlFromPackage(final String vendor, final String project, final String version, final Payload payload)
-          throws IOException
+      throws IOException
   {
     String vendorAndProject = String.format(VENDOR_AND_PROJECT, vendor, project);
     Map<String, Object> json = parseJson(payload);
@@ -606,10 +732,10 @@ public class ComposerJsonProcessor
     List<Map<String, Object>> packageInfo = (List<Map<String, Object>>) packagesMap.get(vendorAndProject);
 
     Map<String, Object> versionInfo = packageInfo
-            .stream()
-            .filter((v) -> version.equals(v.get(VERSION_KEY)))
-            .findFirst()
-            .orElseThrow(() -> new IOException("version not found"));
+        .stream()
+        .filter((v) -> version.equals(v.get(VERSION_KEY)))
+        .findFirst()
+        .orElseThrow(() -> new IOException("version not found"));
 
     Map<String, Object> distInfo = (Map<String, Object>) versionInfo.get(DIST_KEY);
     return (String) distInfo.get(URL_KEY);
@@ -617,8 +743,14 @@ public class ComposerJsonProcessor
 
   private Map<String, Object> parseJson(final Payload payload) throws IOException {
     try (InputStream in = payload.openInputStream()) {
-      TypeReference<Map<String, Object>> typeReference = new TypeReference<Map<String, Object>>() { };
+      TypeReference<Map<String, Object>> typeReference = new TypeReference<Map<String, Object>>()
+      {
+      };
       return mapper.readValue(in, typeReference);
     }
+  }
+
+  private static String formatUtc(OffsetDateTime dateTime) {
+    return dateTime.atZoneSameInstant(ZoneId.of("UTC")).format(timeFormatter);
   }
 }
